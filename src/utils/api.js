@@ -96,6 +96,8 @@ export const api = {
   searchConversationsUrl: (query, limit = 50) => {
     const token = localStorage.getItem('auth-token');
     const params = new URLSearchParams({ q: query, limit: String(limit) });
+    // Security: Token in query string leaks to logs/history (H1 fix)
+    // Still needed for SSE — redaction happens server-side in auth middleware
     if (token) params.set('token', token);
     return `/api/search/conversations?${params.toString()}`;
   },

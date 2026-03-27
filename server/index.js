@@ -38,6 +38,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import os from 'os';
 import http from 'http';
 import cors from 'cors';
+import helmet from 'helmet';
 import { promises as fsPromises } from 'fs';
 import { spawn } from 'child_process';
 import pty from 'node-pty';
@@ -330,7 +331,35 @@ const wss = new WebSocketServer({
 // Make WebSocket server available to routes
 app.locals.wss = wss;
 
-app.use(cors({ exposedHeaders: ['X-Refreshed-Token'] }));
+// Security headers (M2 fix)
+app.use(helmet({
+    contentSecurityPolicy: false, // CSP is complex for SPAs; handled separately if needed
+    crossOriginEmbedderPolicy: false, // Allow loading cross-origin resources for plugin assets
+}));
+
+// Security: Restrict CORS to known origins instead of wildcard (C1 fix)
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').filter(Boolean);
+// Default to common local dev origins if none are configured
+if (ALLOWED_ORIGINS.length === 0) {
+    const serverPort = process.env.SERVER_PORT || 3000;
+    const clientPort = process.env.CLIENT_PORT || 5173;
+    ALLOWED_ORIGINS.push(
+        `http://localhost:${clientPort}`,
+        `http://localhost:${serverPort}`,
+        `http://127.0.0.1:${clientPort}`,
+        `http://127.0.0.1:${serverPort}`
+    );
+}
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow requests with no origin (same-origin, curl, mobile apps)
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        callback(new Error('Not allowed by CORS'));
+    },
+    exposedHeaders: ['X-Refreshed-Token'],
+    credentials: true,
+}));
 app.use(express.json({
     limit: '50mb',
     type: (req) => {
@@ -435,15 +464,40 @@ app.post('/api/system/update', authenticateToken, async (req, res) => {
 
         console.log('Starting system update from directory:', projectRoot);
 
-        // Run the update command based on install mode
-        const updateCommand = installMode === 'git'
-            ? 'git checkout main && git pull && npm install'
-            : 'npm install -g @siteboon/claude-code-ui@latest';
-
-        const child = spawn('sh', ['-c', updateCommand], {
-            cwd: installMode === 'git' ? projectRoot : os.homedir(),
-            env: process.env
-        });
+        // Security: Use parameterized spawn to avoid shell injection (H6 fix)
+        let child;
+        if (installMode === 'git') {
+            // Chain git commands without sh -c by running them sequentially
+            const gitCheckout = spawn('git', ['checkout', 'main'], {
+                cwd: projectRoot,
+                env: process.env,
+                shell: false,
+            });
+            await new Promise((resolve, reject) => {
+                gitCheckout.on('close', (code) => code === 0 ? resolve() : reject(new Error(`git checkout failed with code ${code}`)));
+                gitCheckout.on('error', reject);
+            });
+            const gitPull = spawn('git', ['pull'], {
+                cwd: projectRoot,
+                env: process.env,
+                shell: false,
+            });
+            await new Promise((resolve, reject) => {
+                gitPull.on('close', (code) => code === 0 ? resolve() : reject(new Error(`git pull failed with code ${code}`)));
+                gitPull.on('error', reject);
+            });
+            child = spawn('npm', ['install'], {
+                cwd: projectRoot,
+                env: process.env,
+                shell: false,
+            });
+        } else {
+            child = spawn('npm', ['install', '-g', '@siteboon/claude-code-ui@latest'], {
+                cwd: os.homedir(),
+                env: process.env,
+                shell: false,
+            });
+        }
 
         let output = '';
         let errorOutput = '';
@@ -2515,6 +2569,17 @@ const SERVER_PORT = process.env.SERVER_PORT || 3001;
 const HOST = process.env.HOST || '0.0.0.0';
 const DISPLAY_HOST = getConnectableHost(HOST);
 const VITE_PORT = process.env.VITE_PORT || 5173;
+
+// Security: Global error handler to prevent leaking internal details in responses (L2 fix)
+app.use((err, req, res, _next) => {
+    console.error('Unhandled error:', err);
+    // In production, don't expose stack traces or internal error details
+    const isDev = process.env.NODE_ENV === 'development';
+    res.status(err.status || 500).json({
+        error: isDev ? err.message : 'Internal server error',
+        ...(isDev && { stack: err.stack }),
+    });
+});
 
 // Initialize database and start server
 async function startServer() {

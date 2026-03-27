@@ -8,6 +8,65 @@ import { dirname } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// =============================================================================
+// Security: Credential encryption helpers (C3 fix)
+// Encrypts sensitive values at rest using AES-256-GCM
+// =============================================================================
+const ENCRYPTION_ALGORITHM = 'aes-256-gcm';
+const IV_LENGTH = 12; // GCM recommended IV length
+const AUTH_TAG_LENGTH = 16;
+
+/**
+ * Derive an encryption key from the JWT secret stored in app_config.
+ * We lazily resolve it after DB init (see getEncryptionKey below).
+ */
+let _encryptionKey = null;
+function getEncryptionKey(dbInstance) {
+  if (_encryptionKey) return _encryptionKey;
+  let secret;
+  try {
+    const row = dbInstance.prepare('SELECT value FROM app_config WHERE key = ?').get('jwt_secret');
+    secret = row?.value;
+  } catch {
+    // Table might not exist yet during first run
+  }
+  if (!secret) {
+    secret = crypto.randomBytes(64).toString('hex');
+  }
+  _encryptionKey = crypto.scryptSync(secret, 'claude-code-ui-credential-encryption', 32);
+  return _encryptionKey;
+}
+
+function encryptValue(plaintext, dbInstance) {
+  const key = getEncryptionKey(dbInstance);
+  const iv = crypto.randomBytes(IV_LENGTH);
+  const cipher = crypto.createCipheriv(ENCRYPTION_ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH });
+  let encrypted = cipher.update(plaintext, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  const authTag = cipher.getAuthTag().toString('hex');
+  // Format: iv:authTag:ciphertext
+  return `enc:${iv.toString('hex')}:${authTag}:${encrypted}`;
+}
+
+function decryptValue(stored, dbInstance) {
+  // Handle legacy unencrypted values gracefully
+  if (!stored || !stored.startsWith('enc:')) {
+    return stored;
+  }
+  const key = getEncryptionKey(dbInstance);
+  const parts = stored.split(':');
+  if (parts.length !== 4) return stored; // Malformed, return as-is
+  const [, ivHex, authTagHex, ciphertext] = parts;
+  const iv = Buffer.from(ivHex, 'hex');
+  const authTag = Buffer.from(authTagHex, 'hex');
+  const decipher = crypto.createDecipheriv(ENCRYPTION_ALGORITHM, key, iv, { authTagLength: AUTH_TAG_LENGTH });
+  decipher.setAuthTag(authTag);
+  let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
+// =============================================================================
+
 // ANSI color codes for terminal output
 const colors = {
     reset: '\x1b[0m',
@@ -341,11 +400,12 @@ const apiKeysDb = {
 
 // User credentials database operations (for GitHub tokens, GitLab tokens, etc.)
 const credentialsDb = {
-  // Create a new credential
+  // Create a new credential (Security: encrypts value at rest — C3 fix)
   createCredential: (userId, credentialName, credentialType, credentialValue, description = null) => {
     try {
+      const encryptedValue = encryptValue(credentialValue, db);
       const stmt = db.prepare('INSERT INTO user_credentials (user_id, credential_name, credential_type, credential_value, description) VALUES (?, ?, ?, ?, ?)');
-      const result = stmt.run(userId, credentialName, credentialType, credentialValue, description);
+      const result = stmt.run(userId, credentialName, credentialType, encryptedValue, description);
       return { id: result.lastInsertRowid, credentialName, credentialType };
     } catch (err) {
       throw err;
@@ -372,11 +432,12 @@ const credentialsDb = {
     }
   },
 
-  // Get active credential value for a user by type (returns most recent active)
+  // Get active credential value for a user by type (Security: decrypts from storage — C3 fix)
   getActiveCredential: (userId, credentialType) => {
     try {
       const row = db.prepare('SELECT credential_value FROM user_credentials WHERE user_id = ? AND credential_type = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1').get(userId, credentialType);
-      return row?.credential_value || null;
+      if (!row?.credential_value) return null;
+      return decryptValue(row.credential_value, db);
     } catch (err) {
       throw err;
     }

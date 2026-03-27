@@ -149,7 +149,8 @@ class SessionManager {
 
     try {
       const filePath = this._safeFilePath(sessionId);
-      await fs.writeFile(filePath, JSON.stringify(session, null, 2));
+      // Security: Restrict file permissions to owner-only (M4 fix)
+      await fs.writeFile(filePath, JSON.stringify(session, null, 2), { mode: 0o600 });
     } catch (error) {
       // console.error('Error saving session:', error);
     }

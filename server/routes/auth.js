@@ -1,9 +1,29 @@
 import express from 'express';
 import bcrypt from 'bcrypt';
+import rateLimit from 'express-rate-limit';
 import { userDb, db } from '../database/db.js';
-import { generateToken, authenticateToken } from '../middleware/auth.js';
+import { generateToken, authenticateToken, revokeToken } from '../middleware/auth.js';
 
 const router = express.Router();
+
+// Security: Rate limit login attempts to prevent brute force (C2 fix)
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // max 10 attempts per window per IP
+  message: { error: 'Too many login attempts. Please try again after 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,
+});
+
+// Security: Rate limit registration to prevent abuse
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5, // max 5 registration attempts per hour per IP
+  message: { error: 'Too many registration attempts. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // Check auth status and setup requirements
 router.get('/status', async (req, res) => {
@@ -20,7 +40,7 @@ router.get('/status', async (req, res) => {
 });
 
 // User registration (setup) - only allowed if no users exist
-router.post('/register', async (req, res) => {
+router.post('/register', registerLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     
@@ -29,9 +49,18 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Username and password are required' });
     }
     
-    if (username.length < 3 || password.length < 6) {
-      return res.status(400).json({ error: 'Username must be at least 3 characters, password at least 6 characters' });
+    // Security: Stronger password policy (M1 fix)
+    if (username.length < 3) {
+      return res.status(400).json({ error: 'Username must be at least 3 characters' });
     }
+    if (password.length < 12) {
+      return res.status(400).json({ error: 'Password must be at least 12 characters' });
+    }
+    
+    // Security: Hash password BEFORE starting the transaction (L1 fix)
+    // bcrypt.hash is async; doing it inside a sync SQLite transaction is fragile
+    const saltRounds = 12;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
     
     // Use a transaction to prevent race conditions
     db.prepare('BEGIN').run();
@@ -43,11 +72,7 @@ router.post('/register', async (req, res) => {
         return res.status(403).json({ error: 'User already exists. This is a single-user system.' });
       }
       
-      // Hash password
-      const saltRounds = 12;
-      const passwordHash = await bcrypt.hash(password, saltRounds);
-      
-      // Create user
+      // Create user with pre-computed hash
       const user = userDb.createUser(username, passwordHash);
       
       // Generate token
@@ -79,7 +104,7 @@ router.post('/register', async (req, res) => {
 });
 
 // User login
-router.post('/login', async (req, res) => {
+router.post('/login', loginLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
     
@@ -125,10 +150,14 @@ router.get('/user', authenticateToken, (req, res) => {
   });
 });
 
-// Logout (client-side token removal, but this endpoint can be used for logging)
+// Logout (server-side token revocation + client-side token removal)
 router.post('/logout', authenticateToken, (req, res) => {
-  // In a simple JWT system, logout is mainly client-side
-  // This endpoint exists for consistency and potential future logging
+  // Security: Revoke the token server-side so it cannot be reused (H3 fix)
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (token) {
+    revokeToken(token);
+  }
   res.json({ success: true, message: 'Logged out successfully' });
 });
 

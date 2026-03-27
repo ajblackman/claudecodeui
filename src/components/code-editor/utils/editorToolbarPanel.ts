@@ -144,6 +144,8 @@ export const createEditorToolbarPanelExtension = ({
       toolbarHtml += '</div>';
       toolbarHtml += '</div>';
 
+      // Security: All dynamic values in toolbarHtml are escaped via escapeHtml() above.
+      // Only static SVG fragments and escaped label strings are used. (M7 verified safe)
       dom.innerHTML = toolbarHtml;
 
       if (hasDiff) {

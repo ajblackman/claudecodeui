@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import DOMPurify from 'dompurify';
 import { authenticatedFetch } from '../../../utils/api';
 
 type Props = {
@@ -25,8 +26,16 @@ export default function PluginIcon({ pluginName, iconFile, className }: Props) {
       })
       .then((text) => {
         if (text && text.trimStart().startsWith('<svg')) {
-          svgCache.set(url, text);
-          setSvg(text);
+          // Security: Sanitize SVG to prevent XSS via event handlers/scripts (H7 fix)
+          const sanitized = DOMPurify.sanitize(text, {
+            USE_PROFILES: { svg: true, svgFilters: true },
+            ADD_TAGS: ['svg', 'path', 'g', 'circle', 'rect', 'line', 'polyline', 'polygon', 'ellipse', 'defs', 'clipPath', 'use', 'text', 'tspan'],
+            ADD_ATTR: ['viewBox', 'xmlns', 'fill', 'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin', 'd', 'cx', 'cy', 'r', 'rx', 'ry', 'x', 'y', 'width', 'height', 'transform', 'opacity', 'class', 'id', 'clip-path', 'fill-rule', 'clip-rule'],
+            FORBID_TAGS: ['script', 'style', 'iframe', 'object', 'embed', 'form', 'input'],
+            FORBID_ATTR: ['onload', 'onerror', 'onclick', 'onmouseover', 'onfocus', 'onblur', 'xlink:href'],
+          });
+          svgCache.set(url, sanitized);
+          setSvg(sanitized);
         }
       })
       .catch(() => {});
@@ -37,7 +46,6 @@ export default function PluginIcon({ pluginName, iconFile, className }: Props) {
   return (
     <span
       className={className}
-      // SVG is fetched from the user's own installed plugin — same trust level as the plugin code itself
       dangerouslySetInnerHTML={{ __html: svg }}
     />
   );
